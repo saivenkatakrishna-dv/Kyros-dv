@@ -12,8 +12,8 @@
 
 #define I2C_STATUS_BUSY        0x1
 
-
-static uint8_t exp_data[128][256];
+//static uint32_t exp_data[129][257];
+//static uint32_t exp_data[128][256];
 
 int main(void)
 {   
@@ -22,12 +22,14 @@ int main(void)
      uint32_t n=256*128;
      uint32_t n_p=0;
      uint32_t prdata;
-     uint32_t slv_addr=0x00;
-     uint32_t reg_addr=0x00;
-     uint32_t data_in=0x12345678;
+     uint32_t slv_addr=0;
+     uint32_t reg_addr=0;
+     uint32_t data_in=0;
     // uint32_t i=1;
-    // uint32_t exp_data[128][256];
+     //uint32_t exp_data[128][256];
      uint32_t act_data;
+
+     int reg_data[256];
 
      uint32_t handshake_from_sv_to_c = 0;
    
@@ -39,20 +41,28 @@ int main(void)
      mmio_write(I2C_BASE_ADDR + I2C_CLKDIV_OFFSET,clk_div_value);
 
      //slv_addr loop
-     for(slv_addr = 0; slv_addr < 128; slv_addr++){
-     for(reg_addr=0; reg_addr<256; reg_addr+=4) {
-     mmio_write(I2C_BASE_ADDR + I2C_SLV_ADDR_OFFSET, slv_addr);
-     mmio_write(I2C_BASE_ADDR + I2C_REG_ADDR_OFFSET, reg_addr);
-     mmio_write(I2C_BASE_ADDR + I2C_DATA_IN_OFFSET, data_in);
-     mmio_write(I2C_BASE_ADDR + I2C_CTRL_OFFSET, 0x05);
-     do {
-         status = mmio_read(I2C_BASE_ADDR + I2C_STATUS_OFFSET);
-     } while ((status & I2C_STATUS_BUSY));
-        exp_data[slv_addr][reg_addr] = data_in;
-        data_in=data_in-10;
-     }
+     for(slv_addr = 0; slv_addr < 128; slv_addr+=1){
+        for(reg_addr=0; reg_addr<256; reg_addr+=4) {
+            mmio_write(I2C_BASE_ADDR + I2C_SLV_ADDR_OFFSET, slv_addr);
+            mmio_write(I2C_BASE_ADDR + I2C_REG_ADDR_OFFSET, reg_addr);
+            mmio_write(I2C_BASE_ADDR + I2C_DATA_IN_OFFSET, data_in);
+            mmio_write(I2C_BASE_ADDR + I2C_CTRL_OFFSET, 0x05);
+            do {
+                status = mmio_read(I2C_BASE_ADDR + I2C_STATUS_OFFSET);
+                info_print(status);
+            } while ((status & I2C_STATUS_BUSY));
+            info_print(57005); //DEAD
+            info_print(slv_addr);
+            info_print(reg_addr);
+           // exp_data[slv_addr][reg_addr] = data_in;
+            reg_data[reg_addr]=data_in;
+            info_print(57005);
+            data_in=data_in+1;
+        }
      }
 
+ 
+/*
      //read
      data_in=0x0000000;
 
@@ -87,7 +97,7 @@ int main(void)
      if (n == n_p) {
          info_print(9999);
      }
-
+*/
      send_handshake_to_sv();
 
 }
