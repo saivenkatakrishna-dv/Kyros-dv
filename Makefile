@@ -275,6 +275,7 @@ gen:
 	cd $(RISCV_DV) && \
 	xrun -64bit -sv -uvm \
 	+svseed=random \
+#	+define+WR_ACK_ER \
 	+asm_file_name=$(PREFIX) \
 	+march=$(ISA) \
 	-uvmhome /tools/cadence_march2021/XCELIUM2009/tools/methodology/UVM/CDNS-1.2 \
