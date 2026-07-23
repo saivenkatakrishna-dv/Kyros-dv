@@ -56,6 +56,11 @@ module pinmux_gpio_ss
     output  logic   [16:0]  irq_in,
 
 //////////////////////////////////////////////////////
+////// XTAL OUT
+//////////////////////////////////////////////////////
+    input  logic            xtal_out,
+
+//////////////////////////////////////////////////////
 ////// DEBUG
 //////////////////////////////////////////////////////
     input   logic           clk_out,
@@ -449,7 +454,7 @@ always_comb begin
   
         PINMUX_PERIPHERAL:
         begin
-            gpio_pad_out[8] = gpio_out_reg[8];
+            gpio_pad_out[8] = xtal_out; 
             gpio_pad_oe [8] = 1'b1;
         end
     
