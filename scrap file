@@ -1,1 +1,419 @@
 
+//=============================================================================
+// File        : usb_data_toggle_tracker_sva.sv
+// Description : SVA assertions and assumptions for usb_data_toggle_tracker
+//
+//=============================================================================
+
+`timescale 1ns/1ps
+import usb_pkg::*;
+
+module usb_data_toggle_tracker_sva #(
+    parameter int PID_WIDTH = 4,
+
+    // USB DATA PID values
+    parameter logic [PID_WIDTH-1:0] PID_DATA0 = 4'h3,
+    parameter logic [PID_WIDTH-1:0] PID_DATA1 = 4'hB,
+    parameter logic [PID_WIDTH-1:0] PID_DATA2 = 4'h7,
+    parameter logic [PID_WIDTH-1:0] PID_MDATA = 4'hF
+)(
+    input logic                     clk,
+    input logic                     rst_n,
+
+    input logic                     use_int_toggle,
+    input logic                     [PID_WIDTH-1:0] sel_pid,
+    input logic                     req_fire_ok,
+    input logic                     req_is_isoc,
+
+    input logic                     done,
+    input logic                     aborted,
+    input logic                     underrun,
+
+    input logic                     ack_rcvd,
+    input logic                     nyet_rcvd,
+    input logic                     toggle_clr,
+
+    input logic                     ext_toggle,
+
+    input logic                     toggle_used,
+    input logic                     ep_toggle,
+    input logic                     ack_pending,
+
+    // Internal DUT state / combinational signals
+    input logic                     tog_q,
+    input logic                     tog_nxt,
+    input logic                     sent_data0_q,
+    input logic                     sent_noniso_q,
+    input logic                     pend_q,
+    input logic                     ack_any
+);
+
+    default clocking cb @(posedge clk); endclocking
+
+    
+    //=========================================================================
+    // 2. OUTPUT MIRROR CHECKS
+    //=========================================================================
+
+    // ep_toggle directly reflects the registered internal toggle.
+    ap_ep_toggle:
+        assert property (disable iff (!rst_n)
+                         ep_toggle == tog_q)
+        else $error("OUTPUT: ep_toggle does not match tog_q");
+
+    // ack_pending directly reflects the registered pending state.
+    ap_ack_pending:
+        assert property (disable iff (!rst_n)
+                         ack_pending == pend_q)
+        else $error("OUTPUT: ack_pending does not match pend_q");
+
+
+    //=========================================================================
+    // 3. TOGGLE SOURCE SELECTION
+    //=========================================================================
+
+    // External-toggle mode must use ext_toggle.
+    ap_external_toggle:
+        assert property (disable iff (!rst_n)
+                         !use_int_toggle |-> toggle_used == ext_toggle)
+        else $error("TOGGLE: external mode does not use ext_toggle");
+
+    // Internal-toggle mode must use tog_nxt.
+    //
+    // This is intentionally |-> because toggle_used is combinational and
+    // directly depends on tog_nxt.
+    ap_internal_toggle:
+        assert property (disable iff (!rst_n)
+                         use_int_toggle |-> toggle_used == tog_nxt)
+        else $error("TOGGLE: internal mode does not use tog_nxt");
+
+
+    //=========================================================================
+    // 4. REQUEST CAPTURE
+    //=========================================================================
+
+    // Accepted request captures whether the packet PID is DATA0.
+    ap_capture_data0:
+        assert property (disable iff (!rst_n)
+                         req_fire_ok
+                         |=> sent_data0_q ==
+                             ($past(sel_pid) == PID_DATA0))
+        else $error("REQUEST: sent_data0_q was not captured correctly");
+
+    // Accepted request captures whether the packet is non-isochronous.
+    ap_capture_noniso:
+        assert property (disable iff (!rst_n)
+                         req_fire_ok
+                         |=> sent_noniso_q == !$past(req_is_isoc))
+        else $error("REQUEST: sent_noniso_q was not captured correctly");
+
+
+    //=========================================================================
+    // 5. PENDING HANDSHAKE STATE
+    //=========================================================================
+
+    // A new accepted request clears any previous pending state.
+    ap_request_clears_pending:
+        assert property (disable iff (!rst_n)
+                         req_fire_ok |=> !pend_q)
+        else $error("PENDING: new request did not clear pend_q");
+
+    // A completed non-isochronous packet creates a pending handshake state.
+    //
+    // Conflicting events are excluded because the RTL gives them priority
+    // over done && sent_noniso_q.
+    ap_done_sets_pending:
+        assert property (disable iff (!rst_n)
+                         (done &&
+                          sent_noniso_q &&
+                          !req_fire_ok &&
+                          !aborted &&
+                          !underrun &&
+                          !ack_any &&
+                          !toggle_clr)
+                         |=> pend_q)
+        else $error("PENDING: completed non-ISO packet did not set pend_q");
+
+    // An isochronous request must not create pending state.
+    ap_iso_request_no_pending:
+        assert property (disable iff (!rst_n)
+                         (req_fire_ok && req_is_isoc)
+                         |=> !pend_q)
+        else $error("PENDING: ISO request created pending state");
+
+    // Abort clears pending.
+    ap_abort_clears_pending:
+        assert property (disable iff (!rst_n)
+                         aborted |=> !pend_q)
+        else $error("PENDING: aborted transaction did not clear pend_q");
+
+    // Underrun clears pending.
+    ap_underrun_clears_pending:
+        assert property (disable iff (!rst_n)
+                         underrun |=> !pend_q)
+        else $error("PENDING: underrun did not clear pend_q");
+
+
+    //=========================================================================
+    // 6. ACK / NYET TOGGLE UPDATE
+    //=========================================================================
+
+    // ACK after DATA0 changes the internal toggle to DATA1.
+    ap_ack_after_data0:
+        assert property (disable iff (!rst_n)
+                         (pend_q &&
+                          ack_rcvd &&
+                          sent_data0_q &&
+                          !toggle_clr)
+                         |=> tog_q == 1'b1)
+        else $error("TOGGLE: ACK after DATA0 did not change toggle to 1");
+
+    // ACK after DATA1 changes the internal toggle to DATA0.
+    //
+    // DATA2/MDATA are treated as non-DATA0 by sent_data0_q in the RTL.
+    ap_ack_after_non_data0:
+        assert property (disable iff (!rst_n)
+                         (pend_q &&
+                          ack_rcvd &&
+                          !sent_data0_q &&
+                          !toggle_clr)
+                         |=> tog_q == 1'b0)
+        else $error("TOGGLE: ACK after non-DATA0 did not change toggle to 0");
+
+    // NYET advances the toggle using the same rule as ACK.
+    ap_nyet_advances_toggle:
+        assert property (disable iff (!rst_n)
+                         (pend_q &&
+                          nyet_rcvd &&
+                          !toggle_clr)
+                         |=> tog_q == $past(sent_data0_q))
+        else $error("TOGGLE: NYET did not advance toggle correctly");
+
+
+    //=========================================================================
+    // 7. PENDING CLEAR AFTER ACK / NYET
+    //=========================================================================
+
+    // ACK or NYET while pending clears the pending state.
+    ap_ack_nyet_clears_pending:
+        assert property (disable iff (!rst_n)
+                         (pend_q &&
+                          (ack_rcvd || nyet_rcvd) &&
+                          !req_fire_ok &&
+                          !toggle_clr)
+                         |=> !pend_q)
+        else $error("PENDING: ACK/NYET did not clear pend_q");
+
+
+    //=========================================================================
+    // 8. TOGGLE HOLD BEHAVIOR
+    //=========================================================================
+
+    // If there is no handshake and no toggle clear, the toggle must hold.
+    ap_toggle_holds_without_handshake:
+        assert property (disable iff (!rst_n)
+                         (!ack_any && !toggle_clr)
+                         |=> tog_q == $past(tog_q))
+        else $error("TOGGLE: toggle changed without ACK/NYET or clear");
+
+    // A stray ACK/NYET while no transaction is pending must not change
+    // the toggle.
+    ap_stray_ack_no_toggle_change:
+        assert property (disable iff (!rst_n)
+                         (!pend_q &&
+                          (ack_rcvd || nyet_rcvd) &&
+                          !toggle_clr)
+                         |=> tog_q == $past(tog_q))
+        else $error("TOGGLE: stray ACK/NYET changed the toggle");
+
+    // ISO request itself must not modify the next toggle value.
+    ap_iso_request_no_toggle_change_comb:
+        assert property (disable iff (!rst_n)
+                         (req_fire_ok &&
+                          req_is_isoc &&
+                          !ack_any &&
+                          !toggle_clr)
+                         |-> tog_nxt == tog_q)
+        else $error("TOGGLE: ISO request changed tog_nxt");
+
+    // Therefore the registered toggle must remain unchanged.
+    ap_iso_request_no_toggle_change:
+        assert property (disable iff (!rst_n)
+                         (req_fire_ok &&
+                          req_is_isoc &&
+                          !ack_any &&
+                          !toggle_clr)
+                         |=> tog_q == $past(tog_q))
+        else $error("TOGGLE: ISO request changed tog_q");
+
+    //=========================================================================
+    // 9. TOGGLE CLEAR
+    //=========================================================================
+
+    // toggle_clr forces internal toggle to DATA0.
+    ap_toggle_clear:
+        assert property (disable iff (!rst_n)
+                         toggle_clr |=> tog_q == 1'b0)
+        else $error("TOGGLE CLEAR: tog_q is not 0");
+
+    // toggle_clr also clears pending state.
+    ap_toggle_clear_pending:
+        assert property (disable iff (!rst_n)
+                         toggle_clr |=> !pend_q)
+        else $error("TOGGLE CLEAR: pend_q was not cleared");
+
+    // toggle_clr has priority over ACK/NYET.
+    ap_clear_wins_ack:
+        assert property (disable iff (!rst_n)
+                         (toggle_clr && ack_any)
+                         |=> tog_q == 1'b0)
+        else $error("TOGGLE CLEAR: clear did not win over ACK/NYET");
+
+
+    //=========================================================================
+    // 10. SAME-CYCLE ACK + NEW REQUEST BYPASS
+    //=========================================================================
+
+    // If an ACK for DATA0 and a new request occur together, internal
+    // toggle_used must already show DATA1.
+    //
+    // |-> is intentional: toggle_used is combinational from tog_nxt.
+    ap_ack_new_request_data0_bypass:
+        assert property (disable iff (!rst_n)
+                         (use_int_toggle &&
+                          pend_q &&
+                          ack_rcvd &&
+                          sent_data0_q &&
+                          req_fire_ok &&
+                          !toggle_clr)
+                         |-> toggle_used == 1'b1)
+        else $error("BYPASS: ACK+new DATA0 request did not use DATA1");
+
+    // If an ACK for non-DATA0 and a new request occur together, internal
+    // toggle_used must already show DATA0.
+    ap_ack_new_request_non_data0_bypass:
+        assert property (disable iff (!rst_n)
+                         (use_int_toggle &&
+                          pend_q &&
+                          ack_rcvd &&
+                          !sent_data0_q &&
+                          req_fire_ok &&
+                          !toggle_clr)
+                         |-> toggle_used == 1'b0)
+        else $error("BYPASS: ACK+new request did not use DATA0");
+
+
+    //=========================================================================
+    // 11. NO SPONTANEOUS STATE CHANGE
+    //=========================================================================
+
+    // Pending state should not appear spontaneously without an accepted
+    // non-ISO completion.
+    //
+    // This is deliberately conservative and excludes events that can
+    // legitimately modify pend_q.
+    ap_no_spontaneous_pending:
+        assert property (disable iff (!rst_n)
+                         (!done &&
+                          !req_fire_ok &&
+                          !aborted &&
+                          !underrun &&
+                          !ack_any &&
+                          !toggle_clr)
+                         |=> pend_q == $past(pend_q))
+        else $error("PENDING: pend_q changed spontaneously");
+
+    // Toggle should not change spontaneously.
+    ap_no_spontaneous_toggle:
+        assert property (disable iff (!rst_n)
+                         (!ack_any && !toggle_clr)
+                         |=> tog_q == $past(tog_q))
+        else $error("TOGGLE: tog_q changed spontaneously");
+
+
+    //=========================================================================
+    // 12. ASSUMPTIONS
+    //=========================================================================
+    //
+
+    // Accepted request must carry a valid DATA PID.
+    as_valid_data_pid:
+        assume property (disable iff (!rst_n)
+                         req_fire_ok |->
+                         sel_pid inside {
+                             PID_DATA0,
+                             PID_DATA1,
+                             PID_DATA2,
+                             PID_MDATA
+                         });
+
+    // ACK and NYET should not occur simultaneously.
+    as_ack_nyet_exclusive:
+        assume property (disable iff (!rst_n)
+                         !(ack_rcvd && nyet_rcvd));
+
+    // ACK is a pulse: it must not remain asserted for two consecutive
+    // cycles. Remove this assumption if the upstream interface allows
+    // multi-cycle ACK indication.
+    as_ack_is_pulse:
+        assume property (disable iff (!rst_n)
+                         ack_rcvd |=> !ack_rcvd);
+
+    // NYET is a pulse.
+    as_nyet_is_pulse:
+        assume property (disable iff (!rst_n)
+                         nyet_rcvd |=> !nyet_rcvd);
+
+    // done is a pulse.
+    as_done_is_pulse:
+        assume property (disable iff (!rst_n)
+                         done |=> !done);
+
+    // aborted is a pulse.
+    as_abort_is_pulse:
+        assume property (disable iff (!rst_n)
+                         aborted |=> !aborted);
+
+    // underrun is a pulse.
+    as_underrun_is_pulse:
+        assume property (disable iff (!rst_n)
+                         underrun |=> !underrun);
+
+    // toggle_clr is a pulse.
+    as_toggle_clear_is_pulse:
+        assume property (disable iff (!rst_n)
+                         toggle_clr |=> !toggle_clr);
+
+
+endmodule
+
+
+ bind usb_data_toggle_tracker usb_data_toggle_tracker_sva #(
+     .PID_WIDTH(4)
+ ) u_usb_data_toggle_tracker_sva (
+     .clk            (clk),
+     .rst_n          (rst_n),
+     .use_int_toggle (use_int_toggle),
+     .sel_pid        (sel_pid),
+     .req_fire_ok    (req_fire_ok),
+     .req_is_isoc    (req_is_isoc),
+     .done           (done),
+     .aborted        (aborted),
+     .underrun       (underrun),
+     .ack_rcvd       (ack_rcvd),
+     .nyet_rcvd      (nyet_rcvd),
+     .toggle_clr     (toggle_clr),
+     .ext_toggle     (ext_toggle),
+     .toggle_used    (toggle_used),
+     .ep_toggle      (ep_toggle),
+     .ack_pending    (ack_pending),
+     .tog_q          (tog_q),
+     .tog_nxt        (tog_nxt),
+     .sent_data0_q   (sent_data0_q),
+     .sent_noniso_q  (sent_noniso_q),
+     .pend_q         (pend_q),
+     .ack_any        (ack_any)
+ );
+//
+//=============================================================================
+
