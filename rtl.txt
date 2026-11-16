@@ -1,0 +1,659 @@
+package usb_pkg;
+  localparam logic [3:0] PID_DATA0 = 4'b0011;   // 0xC3
+  localparam logic [3:0] PID_DATA1 = 4'b1011;   // 0x4B
+  localparam logic [3:0] PID_DATA2 = 4'b0111;   // 0x87 (HS only)
+  localparam logic [3:0] PID_MDATA = 4'b1111;   // 0x0F (HS only)
+
+  localparam logic [15:0] CRC16_INIT = 16'hFFFF;
+  localparam logic [15:0] CRC16_POLY = 16'h8005;
+
+  localparam logic [1:0] EP_CTRL = 2'b00;
+  localparam logic [1:0] EP_ISOC = 2'b01;
+  localparam logic [1:0] EP_BULK = 2'b10;
+  localparam logic [1:0] EP_INTR = 2'b11;
+
+  localparam logic [10:0] MAXPKT_LS      = 11'd8;
+  localparam logic [10:0] MAXPKT_FS      = 11'd64;
+  localparam logic [10:0] MAXPKT_FS_ISO  = 11'd1023;
+  localparam logic [10:0] MAXPKT_HS_CTRL = 11'd64;
+  localparam logic [10:0] MAXPKT_HS_BULK = 11'd512;
+  localparam logic [10:0] MAXPKT_HS      = 11'd1024;
+
+
+ localparam logic [10:0] SETUP_LEN      = 11'd8;   // USB 2.0 5.5.3 / 8.5.3
+
+endpackage : usb_pkg
+
+
+module usb_byte_counter #(
+  parameter int unsigned LEN_W = 10
+) (
+  input  logic             clk,
+  input  logic             rst_n,
+  input  logic             start,
+  input  logic [LEN_W-1:0] length,
+  input  logic             byte_accepted,
+  output logic             is_last,
+  output logic             is_zero_len
+);
+  logic [LEN_W-1:0] cnt;
+  logic             zero_q;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      cnt    <= '0;
+      zero_q <= 1'b0;
+    end else if (start) begin
+      cnt    <= length;
+      zero_q <= (length == '0);
+    end else if (byte_accepted && cnt != '0) begin
+      cnt    <= cnt - 1'b1;
+    end
+  end
+
+  assign is_last     = (cnt == LEN_W'(1));
+  assign is_zero_len = zero_q;
+endmodule
+
+module usb_crc16_gen
+  import usb_pkg::*;
+(
+  input  logic        clk,
+  input  logic        rst_n,
+  input  logic        init,
+  input  logic        data_valid,
+  input  logic [7:0]  data_in,
+  output logic [15:0] crc_out,
+  output logic [15:0] crc_next_out
+);
+  function automatic logic [15:0] crc16_byte(input logic [15:0] c, input logic [7:0] d);
+    logic [15:0] r;
+    logic        fb;
+    r = c;
+    for (int i = 0; i < 8; i++) begin
+      fb = r[15] ^ d[i];
+      r  = {r[14:0], 1'b0};
+      if (fb) r = r ^ CRC16_POLY;
+    end
+    return r;
+  endfunction
+
+  logic [15:0] crc_q, crc_nxt;
+
+  assign crc_nxt      = crc16_byte(crc_q, data_in);
+  assign crc_out      = ~crc_q;
+  assign crc_next_out = ~crc_nxt;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n)          crc_q <= CRC16_INIT;
+    else if (init)       crc_q <= CRC16_INIT;
+    else if (data_valid) crc_q <= crc_nxt;
+  end
+endmodule
+module usb_crc16_splitter (
+  input  logic        clk,
+  input  logic        rst_n,
+  input  logic        load,
+  input  logic        load_second,   // 1 = start at low byte (high byte already sent)
+  input  logic [15:0] crc_in,
+  input  logic        advance,
+  output logic [7:0]  crc_byte,
+  output logic        crc_last
+);
+  function automatic logic [7:0] rev8(input logic [7:0] x);
+    logic [7:0] y;
+    for (int i = 0; i < 8; i++) y[i] = x[7 - i];
+    return y;
+  endfunction
+
+  logic [15:0] crc_q;
+  logic        idx_q;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      crc_q <= 16'd0;
+      idx_q <= 1'b0;
+    end else if (load) begin
+      crc_q <= crc_in;
+      idx_q <= load_second;
+    end else if (advance) begin
+      idx_q <= 1'b1;
+    end
+  end
+
+  assign crc_byte = idx_q ? rev8(crc_q[7:0]) : rev8(crc_q[15:8]);
+  assign crc_last = idx_q;
+endmodule
+
+module usb_data_toggle_tracker
+  import usb_pkg::*;
+(
+  input  logic       clk,
+  input  logic       rst_n,
+
+  input  logic       use_int_toggle,
+  input  logic       ext_toggle,
+  input  logic       req_fire_ok,
+  input  logic [3:0] sel_pid,
+  input  logic       req_is_isoc,
+  input  logic       done,
+  input  logic       aborted,
+  input  logic       underrun,
+  input  logic       ack_rcvd,
+  input  logic       nyet_rcvd,
+  input  logic       toggle_clr,
+
+  output logic       toggle_used,
+  output logic       ep_toggle,
+  output logic       ack_pending
+);
+  logic tog_q;
+  logic sent_data0_q;
+  logic sent_noniso_q;
+  logic pend_q;
+
+  wire ack_any = (ack_rcvd | nyet_rcvd) && pend_q;
+
+  logic tog_nxt;
+  always_comb begin
+    tog_nxt = tog_q;
+    if (ack_any)    tog_nxt = sent_data0_q;
+    if (toggle_clr) tog_nxt = 1'b0;
+  end
+
+  assign toggle_used = use_int_toggle ? tog_nxt : ext_toggle;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      tog_q         <= 1'b0;
+      sent_data0_q  <= 1'b1;
+      sent_noniso_q <= 1'b0;
+      pend_q        <= 1'b0;
+    end else begin
+      if (done && sent_noniso_q) pend_q <= 1'b1;
+      if (aborted || underrun)   pend_q <= 1'b0;
+
+      if (req_fire_ok) begin
+        sent_data0_q  <= (sel_pid == PID_DATA0);
+        sent_noniso_q <= !req_is_isoc;
+        pend_q        <= 1'b0;
+      end
+
+      tog_q <= tog_nxt;
+      if (ack_any)    pend_q <= 1'b0;
+      if (toggle_clr) pend_q <= 1'b0;
+    end
+  end
+
+  assign ep_toggle   = tog_q;
+  assign ack_pending = pend_q;
+endmodule
+
+
+module usb_data_tx_top
+  import usb_pkg::*;
+#(
+  parameter bit          HS_SUPPORT = 1'b0,
+  parameter int unsigned MAX_PKT    = (HS_SUPPORT ? 1024 : 1023),
+  localparam int unsigned LEN_W     = $clog2(MAX_PKT + 1)
+) (
+  input  logic             clk,
+  input  logic             rst_n,
+
+  input  logic             req_valid,
+  output logic             req_ready,
+  input  logic             req_use_int_toggle,
+  input  logic             req_toggle,
+  input  logic             req_force_data0,   // SETUP data packet (DATA0, CONTROL ep, 8 bytes)
+  input  logic [1:0]       req_type,
+  input  logic             ls_mode,
+  input  logic             hs_mode,
+  input  logic             req_dir_in,
+  input  logic [1:0]       req_mult,
+  input  logic [1:0]       req_tx_idx,
+  input  logic [LEN_W-1:0] req_length,
+  input  logic [LEN_W-1:0] cfg_max_pkt,
+  input  logic             abort,
+
+  input  logic [7:0]       pld_data,
+  input  logic             pld_valid,
+  output logic             pld_ready,
+
+  output logic [7:0]       tx_data,
+  output logic             tx_valid,
+  input  logic             tx_ready,
+  output logic             tx_sop,
+  output logic             tx_eop,
+  output logic             tx_bs_viol,
+  output logic             pkt_active,
+
+  input  logic             ack_rcvd,
+  input  logic             nyet_rcvd,
+  input  logic             toggle_clr,
+  output logic             ep_toggle,
+  output logic             ack_pending,
+
+  output logic             done,
+  output logic             err_req,
+  output logic             aborted,
+  output logic             underrun
+);
+  logic [3:0] sel_pid;
+  logic [7:0] sel_pid_byte;
+  logic       sel_err, toggle_used, hs_eff, asm_req_ready, asm_req_valid, req_fire_ok;
+
+  wire req_is_isoc = (req_type == EP_ISOC);
+
+  assign req_ready = asm_req_ready;
+
+  usb_data_toggle_tracker u_tog (
+    .clk(clk), .rst_n(rst_n),
+    .use_int_toggle(req_use_int_toggle), .ext_toggle(req_toggle),
+    .req_fire_ok(req_fire_ok), .sel_pid(sel_pid), .req_is_isoc(req_is_isoc),
+    .done(done), .aborted(aborted), .underrun(underrun),
+    .ack_rcvd(ack_rcvd), .nyet_rcvd(nyet_rcvd), .toggle_clr(toggle_clr),
+    .toggle_used(toggle_used), .ep_toggle(ep_toggle), .ack_pending(ack_pending)
+  );
+
+  usb_pid_selector #(.HS_SUPPORT(HS_SUPPORT)) u_sel (
+    .toggle_bit(toggle_used), .force_data0(req_force_data0), .is_isoc(req_is_isoc),
+    .hs_mode(hs_mode), .dir_in(req_dir_in), .mult(req_mult), .tx_idx(req_tx_idx),
+    .pid(sel_pid), .pid_byte(sel_pid_byte), .pid_err(sel_err)
+  );
+
+  usb_tx_req_gate #(.HS_SUPPORT(HS_SUPPORT), .MAX_PKT(MAX_PKT), .LEN_W(LEN_W)) u_gate (
+    .clk(clk), .rst_n(rst_n),
+    .req_valid(req_valid), .asm_req_ready(asm_req_ready),
+    .req_type(req_type), .req_force_data0(req_force_data0),
+    .ls_mode(ls_mode), .hs_mode(hs_mode),
+    .req_length(req_length), .cfg_max_pkt(cfg_max_pkt), .sel_err(sel_err),
+    .asm_req_valid(asm_req_valid), .req_fire_ok(req_fire_ok),
+    .hs_eff(hs_eff), .err_req(err_req)
+  );
+
+  usb_packet_assembler #(.LEN_W(LEN_W)) u_asm (
+    .clk(clk), .rst_n(rst_n),
+    .req_valid(asm_req_valid), .req_ready(asm_req_ready),
+    .req_pid_byte(sel_pid_byte), .req_length(req_length),
+    .abort(abort),
+    .hs_mode(hs_eff),
+    .pld_data(pld_data), .pld_valid(pld_valid), .pld_ready(pld_ready),
+    .tx_data(tx_data), .tx_valid(tx_valid), .tx_ready(tx_ready),
+    .tx_sop(tx_sop), .tx_eop(tx_eop), .tx_bs_viol(tx_bs_viol),
+    .pkt_active(pkt_active),
+    .done(done), .aborted(aborted), .underrun(underrun)
+  );
+endmodule
+module usb_packet_assembler
+  import usb_pkg::*;
+#(
+  parameter int unsigned LEN_W = 10
+) (
+  input  logic             clk,
+  input  logic             rst_n,
+
+  input  logic             req_valid,
+  output logic             req_ready,
+  input  logic [7:0]       req_pid_byte,
+  input  logic [LEN_W-1:0] req_length,
+  input  logic             abort,
+  input  logic             hs_mode,      // 1 = HS (inverted-CRC error), 0 = FS/LS (stuff violation)
+
+  input  logic [7:0]       pld_data,
+  input  logic             pld_valid,
+  output logic             pld_ready,
+
+  output logic [7:0]       tx_data,
+  output logic             tx_valid,
+  input  logic             tx_ready,
+  output logic             tx_sop,
+  output logic             tx_eop,
+  output logic             tx_bs_viol,   // FS/LS: SIE must NOT insert a stuff bit for this byte
+  output logic             pkt_active,
+
+  output logic             done,
+  output logic             aborted,
+  output logic             underrun
+);
+  typedef enum logic [1:0] {S_IDLE, S_PID, S_DATA, S_CRC} state_t;
+  state_t state;
+
+  logic [7:0] pid_byte_q;
+  logic       err_q;
+  logic       hs_q;                      // hs_mode latched at packet start
+
+  function automatic logic [7:0] rev8(input logic [7:0] x);
+    logic [7:0] y;
+    for (int i = 0; i < 8; i++) y[i] = x[7 - i];
+    return y;
+  endfunction
+
+  //--------------------------------------------------------------------------
+  // presented-byte lock
+  //--------------------------------------------------------------------------
+  logic       lock_q;        // a byte is on offer and has not been accepted yet
+  logic       lock_err_q;    // ... and it is the underrun error byte
+  logic [7:0] lock_data_q;   // ... or this payload byte
+
+  logic       use_err;       // effective decision for the byte presented now
+  logic [7:0] cur_byte;      // effective payload byte presented now
+  assign use_err  = lock_q ? lock_err_q  : !pld_valid;
+  assign cur_byte = lock_q ? lock_data_q : pld_data;
+
+  logic start, byte_acc;
+  assign start     = (state == S_IDLE) && req_valid;
+  assign pld_ready = (state == S_DATA) && tx_ready && !abort && !use_err;
+  assign byte_acc  = pld_ready;
+
+  logic under_now;
+  assign under_now = (state == S_DATA) && use_err;
+
+  logic cnt_last, cnt_zero;
+  usb_byte_counter #(.LEN_W(LEN_W)) u_cnt (
+    .clk(clk), .rst_n(rst_n), .start(start), .length(req_length),
+    .byte_accepted(byte_acc), .is_last(cnt_last), .is_zero_len(cnt_zero)
+  );
+
+  logic [15:0] crc_out, crc_next_out;
+  usb_crc16_gen u_crc (
+    .clk(clk), .rst_n(rst_n), .init(start), .data_valid(byte_acc),
+    .data_in(cur_byte), .crc_out(crc_out), .crc_next_out(crc_next_out)
+  );
+
+  logic        split_load, split_second, crc_last;
+  logic [15:0] split_in;
+  logic [7:0]  crc_byte;
+
+  usb_crc16_splitter u_split (
+    .clk(clk), .rst_n(rst_n), .load(split_load), .load_second(split_second),
+    .crc_in(split_in),
+    .advance((state == S_CRC) && tx_ready && !abort),
+    .crc_byte(crc_byte), .crc_last(crc_last)
+  );
+
+  always_comb begin
+    split_load   = 1'b0;
+    split_second = 1'b0;
+    split_in     = crc_next_out;
+    if (state == S_PID && tx_ready && cnt_zero && !abort) begin
+      split_load = 1'b1;
+      split_in   = crc_out;
+    end else if (byte_acc && cnt_last) begin
+      split_load = 1'b1;
+      split_in   = crc_next_out;
+    end else if (under_now && tx_ready && !abort && hs_q) begin
+      split_load   = 1'b1;
+      split_second = 1'b1;
+      split_in     = ~crc_out;
+    end
+  end
+
+  logic tx_valid_raw, tx_sop_raw, tx_eop_raw, tx_bs_raw;
+  always_comb begin
+    tx_data      = 8'h00;
+    tx_valid_raw = 1'b0;
+    tx_sop_raw   = 1'b0;
+    tx_eop_raw   = 1'b0;
+    tx_bs_raw    = 1'b0;
+    case (state)
+      S_PID:  begin tx_data = pid_byte_q; tx_valid_raw = 1'b1; tx_sop_raw = 1'b1; end
+      S_DATA: begin
+        tx_valid_raw = 1'b1;
+        if (!use_err) begin
+          tx_data = cur_byte;
+        end else if (hs_q) begin
+          tx_data = rev8(~crc_out[15:8]);
+        end else begin
+          tx_data    = 8'hFF;
+          tx_bs_raw  = 1'b1;
+          tx_eop_raw = 1'b1;
+        end
+      end
+      S_CRC:  begin tx_data = crc_byte;   tx_valid_raw = 1'b1; tx_eop_raw = crc_last; end
+      default: ;
+    endcase
+  end
+  // every strobe is qualified by !abort so that sop/eop/bs_viol are never
+  // asserted without tx_valid
+  assign tx_valid   = tx_valid_raw && !abort;
+  assign tx_sop     = tx_sop_raw   && !abort;
+  assign tx_eop     = tx_eop_raw   && !abort;
+  assign tx_bs_viol = tx_bs_raw    && !abort;
+
+  assign req_ready  = (state == S_IDLE);
+  assign pkt_active = (state != S_IDLE);
+
+  logic done_q, abort_q, under_q;
+  assign done     = done_q;
+  assign aborted  = abort_q;
+  assign underrun = under_q;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      state       <= S_IDLE;
+      pid_byte_q  <= 8'h00;
+      done_q      <= 1'b0;
+      abort_q     <= 1'b0;
+      under_q     <= 1'b0;
+      err_q       <= 1'b0;
+      hs_q        <= 1'b0;
+      lock_q      <= 1'b0;
+      lock_err_q  <= 1'b0;
+      lock_data_q <= 8'h00;
+    end else begin
+      done_q  <= 1'b0;
+      abort_q <= 1'b0;
+      under_q <= 1'b0;
+
+      if (abort && state != S_IDLE) begin
+        state   <= S_IDLE;
+        abort_q <= 1'b1;
+        err_q   <= 1'b0;
+        lock_q  <= 1'b0;
+      end else begin
+        case (state)
+          S_IDLE: if (req_valid) begin
+            pid_byte_q <= req_pid_byte;
+            hs_q       <= hs_mode;
+            err_q      <= 1'b0;
+            lock_q     <= 1'b0;
+            state      <= S_PID;
+          end
+          S_PID:  if (tx_ready) state <= cnt_zero ? S_CRC : S_DATA;
+          S_DATA: begin
+            if (!tx_ready) begin
+              // byte offered but not accepted: freeze what is on offer
+              lock_q      <= 1'b1;
+              lock_err_q  <= use_err;
+              lock_data_q <= cur_byte;
+            end else begin
+              lock_q <= 1'b0;
+              if (use_err) begin
+                if (hs_q) begin
+                  err_q <= 1'b1;
+                  state <= S_CRC;
+                end else begin
+                  state   <= S_IDLE;
+                  under_q <= 1'b1;
+                end
+              end else if (cnt_last) begin
+                state <= S_CRC;
+              end
+            end
+          end
+          S_CRC:  if (tx_ready && crc_last) begin
+            state <= S_IDLE;
+            err_q <= 1'b0;
+            if (err_q) under_q <= 1'b1;
+            else       done_q  <= 1'b1;
+          end
+          default: state <= S_IDLE;
+        endcase
+      end
+    end
+  end
+endmodule
+
+module usb_pid_selector
+  import usb_pkg::*;
+#(
+  parameter bit HS_SUPPORT = 1'b0
+) (
+  input  logic       toggle_bit,
+  input  logic       force_data0,
+  input  logic       is_isoc,
+  input  logic       hs_mode,
+  input  logic       dir_in,
+  input  logic [1:0] mult,
+  input  logic [1:0] tx_idx,
+  output logic [3:0] pid,
+  output logic [7:0] pid_byte,
+  output logic       pid_err
+);
+  generate
+    if (HS_SUPPORT) begin : g_hs
+      logic [1:0] remain;
+      always_comb begin
+        pid     = PID_DATA0;
+        pid_err = 1'b0;
+        remain  = 2'd0;
+        if (is_isoc) begin
+          if (!hs_mode) begin
+            pid = PID_DATA0;
+          end else if (mult == 2'd0 || tx_idx >= mult) begin
+            pid_err = 1'b1;
+          end else begin
+            remain = mult - tx_idx - 2'd1;
+            if (dir_in) begin
+              case (remain)
+                2'd0:    pid = PID_DATA0;
+                2'd1:    pid = PID_DATA1;
+                default: pid = PID_DATA2;
+              endcase
+            end else begin
+              if (remain != 2'd0) pid = PID_MDATA;
+              else begin
+                case (mult)
+                  2'd1:    pid = PID_DATA0;
+                  2'd2:    pid = PID_DATA1;
+                  default: pid = PID_DATA2;
+                endcase
+              end
+            end
+          end
+        end else if (force_data0) begin
+          pid = PID_DATA0;
+        end else begin
+          pid = toggle_bit ? PID_DATA1 : PID_DATA0;
+        end
+      end
+    end else begin : g_fsls
+      assign pid     = (is_isoc || force_data0 || !toggle_bit) ? PID_DATA0 : PID_DATA1;
+      assign pid_err = 1'b0;
+      wire   unused_ok = &{1'b0, hs_mode, dir_in, mult, tx_idx};
+    end
+  endgenerate
+
+  assign pid_byte = {~pid, pid};
+endmodule
+
+
+module usb_tx_req_gate
+  import usb_pkg::*;
+#(
+  parameter bit          HS_SUPPORT = 1'b0,
+  parameter int unsigned MAX_PKT    = 1023,
+  parameter int unsigned LEN_W      = $clog2(MAX_PKT + 1)
+) (
+  input  logic             clk,
+  input  logic             rst_n,
+
+  input  logic             req_valid,
+  input  logic             asm_req_ready,
+  input  logic [1:0]       req_type,
+  input  logic             req_force_data0,   // SETUP data packet
+  input  logic             ls_mode,
+  input  logic             hs_mode,
+  input  logic [LEN_W-1:0] req_length,
+  input  logic [LEN_W-1:0] cfg_max_pkt,
+  input  logic             sel_err,
+
+  output logic             asm_req_valid,
+  output logic             req_fire_ok,
+  output logic             hs_eff,
+  output logic             err_req
+);
+  logic [10:0] len11, cfg11, type_max, eff_max;
+  logic        cfg_ok, setup_bad, req_bad, rej_q;
+
+  assign hs_eff = HS_SUPPORT && hs_mode;
+  assign len11  = 11'(req_length);
+  assign cfg11  = 11'(cfg_max_pkt);
+
+  // ---- maximum packet size of the transfer type ------------------------------
+  always_comb begin
+    if (ls_mode) begin
+      type_max = MAXPKT_LS;
+    end else if (hs_eff) begin
+      case (req_type)
+        EP_CTRL: type_max = MAXPKT_HS_CTRL;
+        EP_BULK: type_max = MAXPKT_HS_BULK;
+        default: type_max = MAXPKT_HS;
+      endcase
+    end else begin
+      type_max = (req_type == EP_ISOC) ? MAXPKT_FS_ISO : MAXPKT_FS;
+    end
+    eff_max = type_max;
+    if (cfg11 < eff_max)        eff_max = cfg11;
+    if (11'(MAX_PKT) < eff_max) eff_max = 11'(MAX_PKT);
+  end
+
+  // ---- legality of the programmed wMaxPacketSize -----------------------------
+  always_comb begin
+    cfg_ok = 1'b0;
+    if (ls_mode) begin
+      case (req_type)
+        EP_CTRL: cfg_ok = (cfg11 == MAXPKT_LS);
+        EP_INTR: cfg_ok = (cfg11 <= MAXPKT_LS);
+        default: cfg_ok = 1'b0;                       // LS: no bulk / isochronous
+      endcase
+    end else if (hs_eff) begin
+      case (req_type)
+        EP_CTRL: cfg_ok = (cfg11 == MAXPKT_HS_CTRL);
+        EP_BULK: cfg_ok = (cfg11 == MAXPKT_HS_BULK);
+        default: cfg_ok = (cfg11 <= MAXPKT_HS);       // interrupt / isochronous
+      endcase
+    end else begin
+      case (req_type)
+        EP_CTRL,
+        EP_BULK: cfg_ok = (cfg11 == 11'd8)  || (cfg11 == 11'd16) ||
+                          (cfg11 == 11'd32) || (cfg11 == 11'd64);
+        EP_INTR: cfg_ok = (cfg11 <= MAXPKT_FS);
+        default: cfg_ok = (cfg11 <= MAXPKT_FS_ISO);   // isochronous
+      endcase
+    end
+  end
+
+  // ---- SETUP data packet: control endpoint, exactly 8 bytes ------------------
+  assign setup_bad = req_force_data0 && ((req_type != EP_CTRL) || (len11 != SETUP_LEN));
+
+  assign req_bad = (len11 > eff_max)
+                || (ls_mode && (req_type == EP_ISOC || req_type == EP_BULK))
+                || (ls_mode && hs_eff)
+                || !cfg_ok
+                || setup_bad
+                || sel_err;
+
+  wire req_fire = req_valid && asm_req_ready;
+  assign req_fire_ok   = req_fire && !req_bad;
+  assign asm_req_valid = req_valid && !req_bad;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) rej_q <= 1'b0;
+    else        rej_q <= req_fire && req_bad;
+  end
+  assign err_req = rej_q;
+endmodule
+
+
+
