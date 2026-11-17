@@ -1,103 +1,222 @@
-//==============================================================================
-// File        : i2c_mb_wr_test.c
-// Description : C mirror of SV random_full_seq for APB-I2C SoC testing
-//==============================================================================
+module usb_packet_assembler
+  import usb_pkg::*;
+#(
+  parameter int unsigned LEN_W = 10
+) (
+  input  logic             clk,
+  input  logic             rst_n,
 
-#include "peripheral.h"
+  input  logic             req_valid,
+  output logic             req_ready,
+  input  logic [7:0]       req_pid_byte,
+  input  logic [LEN_W-1:0] req_length,
+  input  logic             abort,
+  input  logic             hs_mode,      // 1 = HS (inverted-CRC error), 0 = FS/LS (stuff violation)
 
+  // Payload interface (valid/ready).  Contract: pld_valid is held high with a stable
+  // pld_data until pld_ready.  A byte is NEEDED only when the PHY can take it
+  // (S_DATA && tx_ready).  pld_valid LOW at that moment is an UNDERRUN.
+  // pld_valid low while tx_ready=0 is NOT an underrun (the byte is not needed yet).
+  input  logic [7:0]       pld_data,
+  input  logic             pld_valid,
+  output logic             pld_ready,
 
-//above should be kept in periheral.h
-#define I2C_INVALID_ADDR_11    0x11
-#define I2C_INVALID_ADDR_13    0x13
+  // Byte stream to the SIE/PHY (valid/ready).  Once tx_valid=1 and tx_ready=0 the
+  // symbol (tx_data, tx_sop, tx_eop, tx_bs_viol) is HELD until it is accepted
+  // (tx_ready=1) or abort is asserted.  While the payload byte is not yet available
+  // and tx_ready=0, tx_valid is LOW (nothing is offered, so nothing needs holding).
+  output logic [7:0]       tx_data,
+  output logic             tx_valid,
+  input  logic             tx_ready,
+  output logic             tx_sop,
+  output logic             tx_eop,
+  output logic             tx_bs_viol,   // FS/LS: SIE must NOT insert a stuff bit for this byte
+  output logic             pkt_active,
 
-#define I2C_STATUS_BUSY        0x1
+  output logic             done,
+  output logic             aborted,
+  output logic             underrun
+);
+  typedef enum logic [1:0] {S_IDLE, S_PID, S_DATA, S_CRC} state_t;
+  state_t state;
 
-//static uint32_t exp_data[129][257];
-//static uint32_t exp_data[128][256];
+  logic [7:0] pid_byte_q;
+  logic       err_q;
 
-int main(void)
-{   
-     uint32_t status;
-     uint32_t clk_div_value = 250;
-     uint32_t n=256*128;
-     uint32_t n_p=0;
-     uint32_t prdata;
-     uint32_t slv_addr=0;
-     uint32_t reg_addr=0;
-     uint32_t data_in=0;
-    // uint32_t i=1;
-     //uint32_t exp_data[128][256];
-     uint32_t act_data;
+  function automatic logic [7:0] rev8(input logic [7:0] x);
+    logic [7:0] y;
+    for (int i = 0; i < 8; i++) y[i] = x[7 - i];
+    return y;
+  endfunction
 
-     int reg_data[256];
+  // ---- symbol presented in S_DATA ---------------------------------------------
+  // Only a real PAYLOAD BYTE is frozen: when it was presented (pld_valid=1) and the
+  // PHY did not accept it (tx_ready=0), it is held unchanged until accepted, even if
+  // pld_valid changes meanwhile.  An underrun is never frozen: it is evaluated
+  // again every cycle and acted upon only when tx_ready=1.
+  logic       frz_q;            // an unaccepted payload byte is being held
+  logic [7:0] frz_data_q;       // the held payload byte
+  logic       sym_err;          // no byte available now (underrun if the PHY is ready)
+  logic [7:0] sym_data;         // payload byte now (when !sym_err)
+  assign sym_err  = !frz_q && !pld_valid;      // a frozen symbol is always a payload byte
+  assign sym_data = frz_q ? frz_data_q : pld_data;
 
-     uint32_t handshake_from_sv_to_c = 0;
-   
-     
-     while (handshake_from_sv_to_c == 0) {
-         handshake_from_sv_to_c = wait_for_handshake_from_sv();
-     }
-     //write
-     mmio_write(I2C_BASE_ADDR + I2C_CLKDIV_OFFSET,clk_div_value);
+  logic start, byte_acc;
+  assign start     = (state == S_IDLE) && req_valid;
+  assign pld_ready = (state == S_DATA) && tx_ready && !abort && !sym_err;
+  assign byte_acc  = pld_ready;                     // payload byte accepted by the PHY
 
-     //slv_addr loop
-     for(slv_addr = 0; slv_addr < 128; slv_addr+=1){
-        for(reg_addr=0; reg_addr<256; reg_addr+=4) {
-            mmio_write(I2C_BASE_ADDR + I2C_SLV_ADDR_OFFSET, slv_addr);
-            mmio_write(I2C_BASE_ADDR + I2C_REG_ADDR_OFFSET, reg_addr);
-            mmio_write(I2C_BASE_ADDR + I2C_DATA_IN_OFFSET, data_in);
-            mmio_write(I2C_BASE_ADDR + I2C_CTRL_OFFSET, 0x05);
-            do {
-                status = mmio_read(I2C_BASE_ADDR + I2C_STATUS_OFFSET);
-                info_print(status);
-            } while ((status & I2C_STATUS_BUSY));
-            info_print(57005); //DEAD
-            info_print(slv_addr);
-            info_print(reg_addr);
-           // exp_data[slv_addr][reg_addr] = data_in;
-            reg_data[reg_addr]=data_in;
-            info_print(57005);
-            data_in=data_in+1;
-        }
-     }
+  // Waiting for data under back-pressure: not an underrun yet, nothing is offered.
+  logic err_wait;
+  assign err_wait = (state == S_DATA) && sym_err && !tx_ready;
 
- 
-/*
-     //read
-     data_in=0x0000000;
+  // Real underrun: byte needed (PHY ready) but not available.
+  logic under_now;
+  assign under_now = (state == S_DATA) && sym_err && tx_ready;
 
-     for(slv_addr = 0; slv_addr < 128; slv_addr++){
-     for(reg_addr=0; reg_addr<256; reg_addr+=4) {
-     mmio_write(I2C_BASE_ADDR + I2C_SLV_ADDR_OFFSET, slv_addr);
-     mmio_write(I2C_BASE_ADDR + I2C_REG_ADDR_OFFSET, reg_addr);
+  logic cnt_last, cnt_zero;
+  usb_byte_counter #(.LEN_W(LEN_W)) u_cnt (
+    .clk(clk), .rst_n(rst_n), .start(start), .length(req_length),
+    .byte_accepted(byte_acc), .is_last(cnt_last), .is_zero_len(cnt_zero)
+  );
 
-     mmio_write(I2C_BASE_ADDR + I2C_CTRL_OFFSET, 0x07);
-     do {
-         status = mmio_read(I2C_BASE_ADDR + I2C_STATUS_OFFSET);
-     } while ((status & I2C_STATUS_BUSY));
+  logic [15:0] crc_out, crc_next_out;
+  usb_crc16_gen u_crc (
+    .clk(clk), .rst_n(rst_n), .init(start), .data_valid(byte_acc),
+    .data_in(sym_data), .crc_out(crc_out), .crc_next_out(crc_next_out)
+  );
 
-     prdata=mmio_read(I2C_BASE_ADDR + I2C_DATA_OUT_OFFSET);
-    // info_print(i); 
-     act_data = prdata;
+  logic        split_load, split_second, crc_last;
+  logic [15:0] split_in;
+  logic [7:0]  crc_byte;
 
-     if (act_data == exp_data[slv_addr][reg_addr]) {
-         info_print(0006);
-         n_p=n_p+1;
-     }
-     else {
-         info_print(57005);
-         info_print(slv_addr);
-         info_print(reg_addr);
-         info_print(act_data);
-         info_print(exp_data[slv_addr][reg_addr]);
+  usb_crc16_splitter u_split (
+    .clk(clk), .rst_n(rst_n), .load(split_load), .load_second(split_second),
+    .crc_in(split_in),
+    .advance((state == S_CRC) && tx_ready && !abort),
+    .crc_byte(crc_byte), .crc_last(crc_last)
+  );
 
-     }
-    }
-     }
-     if (n == n_p) {
-         info_print(9999);
-     }
-*/
-     send_handshake_to_sv();
+  always_comb begin
+    split_load   = 1'b0;
+    split_second = 1'b0;
+    split_in     = crc_next_out;
+    if (state == S_PID && tx_ready && cnt_zero && !abort) begin
+      split_load = 1'b1;
+      split_in   = crc_out;
+    end else if (byte_acc && cnt_last) begin
+      split_load = 1'b1;
+      split_in   = crc_next_out;
+    end else if (under_now && !abort && hs_mode) begin
+      split_load   = 1'b1;
+      split_second = 1'b1;
+      split_in     = ~crc_out;          // complement of the CRC of the bytes sent so far
+    end
+  end
 
-}
+  logic tx_valid_raw, tx_sop_raw, tx_eop_raw, tx_bs_raw;
+  always_comb begin
+    tx_data      = 8'h00;
+    tx_valid_raw = 1'b0;
+    tx_sop_raw   = 1'b0;
+    tx_eop_raw   = 1'b0;
+    tx_bs_raw    = 1'b0;
+    case (state)
+      S_PID:  begin tx_data = pid_byte_q; tx_valid_raw = 1'b1; tx_sop_raw = 1'b1; end
+      S_DATA: begin
+        // No gap while the PHY is sampling: if the PHY is ready (tx_ready=1) a symbol
+        // (payload byte or underrun error symbol) is always offered.  Only while the
+        // PHY is busy (tx_ready=0) AND no byte is available yet is nothing offered.
+        tx_valid_raw = !err_wait;
+        if (!sym_err) begin
+          tx_data = sym_data;
+        end else if (hs_mode) begin
+          tx_data = rev8(~crc_out[15:8]);             // HS: inverted CRC, high byte
+        end else begin
+          tx_data    = 8'hFF;                         // FS/LS: all ones ...
+          tx_bs_raw  = 1'b1;                          // ... with NO stuff bit
+          tx_eop_raw = 1'b1;
+        end
+      end
+      S_CRC:  begin tx_data = crc_byte;   tx_valid_raw = 1'b1; tx_eop_raw = crc_last; end
+      default: ;
+    endcase
+  end
+  // every strobe is qualified by tx_valid_raw and !abort so that sop/eop/bs_viol are
+  // never asserted without tx_valid
+  assign tx_valid   = tx_valid_raw && !abort;
+  assign tx_sop     = tx_sop_raw   && tx_valid_raw && !abort;
+  assign tx_eop     = tx_eop_raw   && tx_valid_raw && !abort;
+  assign tx_bs_viol = tx_bs_raw    && tx_valid_raw && !abort;
+
+  assign req_ready  = (state == S_IDLE);
+  assign pkt_active = (state != S_IDLE);
+
+  logic done_q, abort_q, under_q;
+  assign done     = done_q;
+  assign aborted  = abort_q;
+  assign underrun = under_q;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      state      <= S_IDLE;
+      pid_byte_q <= 8'h00;
+      done_q     <= 1'b0;
+      abort_q    <= 1'b0;
+      under_q    <= 1'b0;
+      err_q      <= 1'b0;
+      frz_q      <= 1'b0;
+      frz_data_q <= 8'h00;
+    end else begin
+      done_q  <= 1'b0;
+      abort_q <= 1'b0;
+      under_q <= 1'b0;
+      frz_q   <= 1'b0;
+
+      if (abort && state != S_IDLE) begin
+        state   <= S_IDLE;
+        abort_q <= 1'b1;
+        err_q   <= 1'b0;
+      end else begin
+        case (state)
+          S_IDLE: if (req_valid) begin
+            pid_byte_q <= req_pid_byte;
+            err_q      <= 1'b0;
+            state      <= S_PID;
+          end
+          S_PID:  if (tx_ready) state <= cnt_zero ? S_CRC : S_DATA;
+          S_DATA: begin
+            if (!tx_ready) begin
+              // PHY busy.  Freeze only a real payload byte.  If no byte is available
+              // yet (pld_valid=0) nothing is frozen and no underrun is decided: the
+              // situation is re-evaluated next cycle.
+              if (!sym_err) begin
+                frz_q      <= 1'b1;
+                frz_data_q <= sym_data;
+              end
+            end else if (sym_err) begin
+              // true underrun: PHY ready, byte needed, none available
+              if (hs_mode) begin
+                err_q <= 1'b1;                        // low CRC byte follows in S_CRC
+                state <= S_CRC;
+              end else begin
+                state   <= S_IDLE;                    // stuff violation + EOP sent
+                under_q <= 1'b1;
+              end
+            end else if (cnt_last) begin
+              state <= S_CRC;
+            end
+          end
+          S_CRC:  if (tx_ready && crc_last) begin
+            state <= S_IDLE;
+            err_q <= 1'b0;
+            if (err_q) under_q <= 1'b1;               // errored packet: underrun, not done
+            else       done_q  <= 1'b1;
+          end
+          default: state <= S_IDLE;
+        endcase
+      end
+    end
+  end
+endmodule
+
